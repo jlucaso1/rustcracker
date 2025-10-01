@@ -18,6 +18,7 @@ pub struct GpuCracker {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    supports_timestamps: bool,
 }
 
 impl GpuCracker {
@@ -41,12 +42,19 @@ impl GpuCracker {
 
         println!("Using GPU: {}", adapter.get_info().name);
 
-        // Request device and queue
+        // Check if timestamp queries are supported
+        let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+
+        // Request device and queue with timestamp support if available
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("GPU Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: if supports_timestamps {
+                        wgpu::Features::TIMESTAMP_QUERY
+                    } else {
+                        wgpu::Features::empty()
+                    },
                     required_limits: wgpu::Limits::default(),
                 },
                 None,
@@ -159,6 +167,7 @@ impl GpuCracker {
             queue,
             pipeline,
             bind_group_layout,
+            supports_timestamps,
         })
     }
 
@@ -389,5 +398,307 @@ impl GpuCracker {
             }
         }
         None
+    }
+
+    /// Process a batch with GPU timing information (for benchmarking)
+    /// Returns (result_index, gpu_time_ns) where gpu_time_ns is the GPU execution time in nanoseconds
+    pub fn process_batch_with_timing(
+        &self,
+        messages: &[&str],
+        target_hash: &[u8; 16],
+    ) -> (Option<usize>, Option<u64>) {
+        if !self.supports_timestamps {
+            // Fall back to regular processing without timing
+            return (self.process_batch(messages, target_hash), None);
+        }
+
+        // Prepare message data (same as process_batch)
+        let mut message_data_bytes = Vec::new();
+        let mut message_lengths = Vec::new();
+        let mut message_offsets = Vec::new();
+        let mut current_offset = 0u32;
+
+        for msg in messages {
+            let msg_bytes = msg.as_bytes();
+            message_offsets.push(current_offset);
+            message_lengths.push(msg_bytes.len() as u32);
+            message_data_bytes.extend_from_slice(msg_bytes);
+            current_offset += msg_bytes.len() as u32;
+        }
+
+        // Convert byte data to u32 array
+        let mut message_data_u32 = Vec::new();
+        for chunk in message_data_bytes.chunks(4) {
+            let mut word = 0u32;
+            for (i, &byte) in chunk.iter().enumerate() {
+                word |= (byte as u32) << (i * 8);
+            }
+            message_data_u32.push(word);
+        }
+
+        // Pad arrays to BATCH_SIZE
+        while message_lengths.len() < BATCH_SIZE {
+            message_offsets.push(current_offset);
+            message_lengths.push(0);
+        }
+
+        // Convert target hash
+        let target = TargetHash {
+            data: [
+                u32::from_le_bytes([
+                    target_hash[0],
+                    target_hash[1],
+                    target_hash[2],
+                    target_hash[3],
+                ]),
+                u32::from_le_bytes([
+                    target_hash[4],
+                    target_hash[5],
+                    target_hash[6],
+                    target_hash[7],
+                ]),
+                u32::from_le_bytes([
+                    target_hash[8],
+                    target_hash[9],
+                    target_hash[10],
+                    target_hash[11],
+                ]),
+                u32::from_le_bytes([
+                    target_hash[12],
+                    target_hash[13],
+                    target_hash[14],
+                    target_hash[15],
+                ]),
+            ],
+        };
+
+        // Create GPU buffers
+        let mut messages_bytes = Vec::with_capacity(message_data_u32.len() * 4);
+        for &word in &message_data_u32 {
+            messages_bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        if messages_bytes.is_empty() {
+            messages_bytes.push(0);
+        }
+        let messages_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Messages Buffer"),
+                contents: &messages_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let mut lengths_bytes = Vec::with_capacity(message_lengths.len() * 4);
+        for &len in &message_lengths {
+            lengths_bytes.extend_from_slice(&len.to_le_bytes());
+        }
+        let lengths_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Lengths Buffer"),
+                contents: &lengths_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let mut offsets_bytes = Vec::with_capacity(message_offsets.len() * 4);
+        for &offset in &message_offsets {
+            offsets_bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        let offsets_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Offsets Buffer"),
+                contents: &offsets_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let mut target_bytes = Vec::with_capacity(16);
+        for &word in &target.data {
+            target_bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let target_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Target Buffer"),
+                contents: &target_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let result_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Result Buffer"),
+                contents: &(-1i32).to_le_bytes(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+
+        let message_count_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Message Count Buffer"),
+                    contents: &(messages.len() as u32).to_le_bytes(),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+        // Create staging buffer for reading results
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create timestamp query set
+        let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("Timestamp Query Set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+
+        let query_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Query Resolve Buffer"),
+            size: 16, // 2 timestamps * 8 bytes
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let query_staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Query Staging Buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create bind group
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MD5 Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: messages_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lengths_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: target_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: result_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: message_count_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Create command encoder and dispatch with timestamps
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("MD5 Command Encoder"),
+            });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("MD5 Crack Pass"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
+            });
+            compute_pass.set_pipeline(&self.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+
+            let num_workgroups = (messages.len() as u32).div_ceil(64);
+            compute_pass.dispatch_workgroups(num_workgroups, 1, 1);
+        }
+
+        // Resolve timestamp queries
+        encoder.resolve_query_set(&query_set, 0..2, &query_buffer, 0);
+        encoder.copy_buffer_to_buffer(&query_buffer, 0, &query_staging_buffer, 0, 16);
+
+        // Copy result to staging buffer
+        encoder.copy_buffer_to_buffer(&result_buffer, 0, &staging_buffer, 0, 4);
+
+        // Submit commands
+        self.queue.submit(Some(encoder.finish()));
+
+        // Read result
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver.recv().unwrap().unwrap();
+
+        let data = buffer_slice.get_mapped_range();
+        let result: i32 = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+        staging_buffer.unmap();
+
+        // Read timestamps
+        let query_slice = query_staging_buffer.slice(..);
+        let (sender2, receiver2) = std::sync::mpsc::channel();
+        query_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender2.send(result).unwrap();
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver2.recv().unwrap().unwrap();
+
+        let timestamp_data = query_slice.get_mapped_range();
+        let start_timestamp = u64::from_le_bytes([
+            timestamp_data[0],
+            timestamp_data[1],
+            timestamp_data[2],
+            timestamp_data[3],
+            timestamp_data[4],
+            timestamp_data[5],
+            timestamp_data[6],
+            timestamp_data[7],
+        ]);
+        let end_timestamp = u64::from_le_bytes([
+            timestamp_data[8],
+            timestamp_data[9],
+            timestamp_data[10],
+            timestamp_data[11],
+            timestamp_data[12],
+            timestamp_data[13],
+            timestamp_data[14],
+            timestamp_data[15],
+        ]);
+        drop(timestamp_data);
+        query_staging_buffer.unmap();
+
+        // Calculate elapsed time in nanoseconds
+        let timestamp_period = self.queue.get_timestamp_period();
+        let gpu_time_ns =
+            ((end_timestamp - start_timestamp) as f64 * timestamp_period as f64) as u64;
+
+        let result_idx = if result >= 0 {
+            Some(result as usize)
+        } else {
+            None
+        };
+
+        (result_idx, Some(gpu_time_ns))
+    }
+
+    /// Get whether this GPU supports timestamp queries
+    pub fn supports_timestamps(&self) -> bool {
+        self.supports_timestamps
     }
 }

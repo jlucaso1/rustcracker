@@ -175,6 +175,114 @@ Modern GPUs can process millions of hashes per second. Actual performance varies
 - **Mid-range GPUs** (RTX 4060, RX 6600, etc.): 1-3 billion hashes/sec
 - **Integrated GPUs** (Intel Iris, Apple M-series): 100-500 million hashes/sec
 
+## Benchmarking
+
+This project includes a comprehensive benchmark suite powered by [Criterion.rs](https://github.com/bheisler/criterion.rs) to measure and track performance across different aspects of the cracker.
+
+### Quick Start
+
+Run all benchmarks:
+```bash
+./run_benchmarks.sh --all
+```
+
+Run with environment checks:
+```bash
+./run_benchmarks.sh --check-env
+./run_benchmarks.sh --all
+```
+
+Run quick benchmarks (fewer samples):
+```bash
+./run_benchmarks.sh --quick --all
+```
+
+### What's Benchmarked
+
+The suite includes benchmarks for:
+
+1. **File I/O Performance** - Wordlist loading and parsing (1K to 1M words)
+2. **Preprocessing Overhead** - Data preparation before GPU submission
+3. **Batch Preparation** - Message packing and encoding overhead
+4. **GPU Throughput** - Raw GPU hashing performance with various batch sizes
+5. **End-to-End Cracking** - Complete scenarios (password at start/middle/end, not found)
+6. **Variable Password Lengths** - Impact of password length on performance (4-64 chars)
+7. **Pure GPU Timing** - GPU-only execution time using timestamp queries (requires GPU support)
+
+### Viewing Results
+
+After running benchmarks, open the HTML report:
+```bash
+# The report is generated at:
+firefox target/criterion/report/index.html
+```
+
+The report includes:
+- Statistical analysis with confidence intervals
+- Violin plots showing performance distribution
+- Comparisons with previous runs
+- Regression detection
+
+### Performance Tracking
+
+Save a baseline for comparison:
+```bash
+./run_benchmarks.sh --all --baseline v1.0
+```
+
+Compare current performance against baseline:
+```bash
+# After making optimizations
+./run_benchmarks.sh --all --compare v1.0
+```
+
+Criterion will automatically detect performance improvements or regressions.
+
+### Advanced Benchmarking
+
+Run specific benchmark groups:
+```bash
+# GPU throughput only
+./run_benchmarks.sh --timing
+
+# Specific group by name
+cargo bench --bench cracker_benchmark -- "GPU Throughput"
+```
+
+Manual benchmark invocation:
+```bash
+# Run all benchmarks with cargo
+cargo bench
+
+# Run specific benchmark file
+cargo bench --bench cracker_benchmark
+cargo bench --bench gpu_timing_benchmark
+```
+
+### Optimal Environment
+
+For reproducible results:
+- **Power**: Plug laptop into AC power
+- **CPU Governor**: Set to performance mode (Linux)
+  ```bash
+  sudo cpupower frequency-set -g performance
+  ```
+- **Background Processes**: Close unnecessary applications
+- **Cooling**: Ensure adequate cooling to prevent thermal throttling
+- **Consistency**: Use same hardware and drivers for comparisons
+
+The `run_benchmarks.sh` script automatically checks these conditions and warns you if the environment isn't optimal.
+
+### Documentation
+
+For detailed benchmarking documentation, see [benches/README.md](benches/README.md), which includes:
+- Complete environment setup guide
+- Interpreting benchmark results
+- GPU timestamp query setup
+- Troubleshooting guide
+- Adding custom benchmarks
+- CI/CD integration examples
+
 ## How It Works
 
 1. **Shader Compilation**: The `build.rs` script uses `spirv-builder` to compile the `/shader` crate to SPIR-V bytecode

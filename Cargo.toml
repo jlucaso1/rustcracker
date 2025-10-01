@@ -16,3 +16,12 @@ spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu" }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "cracker_benchmark"
+harness = false
+
+[[bench]]
+name = "gpu_timing_benchmark"
+harness = false
