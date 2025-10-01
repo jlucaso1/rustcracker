@@ -9,7 +9,7 @@ fn bench_pure_gpu_timing(c: &mut Criterion) {
     let mut group = c.benchmark_group("Pure GPU Timing");
     group.sample_size(20);
 
-    let cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
+    let mut cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
 
     if !cracker.supports_timestamps() {
         println!(
@@ -46,7 +46,7 @@ fn bench_pure_gpu_timing(c: &mut Criterion) {
 /// Custom benchmark runner that reports GPU hashing rate
 #[allow(dead_code)]
 fn bench_gpu_hashing_rate(_c: &mut Criterion) {
-    let cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
+    let mut cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
 
     if !cracker.supports_timestamps() {
         println!("Warning: GPU timestamp queries not supported");

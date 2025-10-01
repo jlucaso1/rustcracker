@@ -68,7 +68,7 @@ async fn test_gpu_cracker_init() {
 #[tokio::test]
 async fn test_simple_crack() {
     // Test cracking a simple hash
-    let cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
+    let mut cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
 
     // md5("password") = 5f4dcc3b5aa765d61d8327deb882cf99
     let target_hash: [u8; 16] = [
@@ -85,7 +85,7 @@ async fn test_simple_crack() {
 #[tokio::test]
 async fn test_crack_not_found() {
     // Test when password is not in wordlist
-    let cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
+    let mut cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
 
     // md5("password") = 5f4dcc3b5aa765d61d8327deb882cf99
     let target_hash: [u8; 16] = [
@@ -102,7 +102,7 @@ async fn test_crack_not_found() {
 #[tokio::test]
 async fn test_multiple_known_hashes() {
     // Test cracking multiple known hashes
-    let cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
+    let mut cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
 
     let test_cases = vec![
         ("password", "5f4dcc3b5aa765d61d8327deb882cf99"),
@@ -130,7 +130,7 @@ async fn test_multiple_known_hashes() {
 #[tokio::test]
 async fn test_large_batch() {
     // Test with a batch larger than BATCH_SIZE
-    let cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
+    let mut cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
 
     // md5("target") = c90c4...  (we'll compute it)
     let target_password = "target";
@@ -152,7 +152,7 @@ async fn test_large_batch() {
 #[tokio::test]
 async fn test_empty_password() {
     // Test cracking an empty password
-    let cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
+    let mut cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
 
     // md5("") = d41d8cd98f00b204e9800998ecf8427e
     let target_hash: [u8; 16] = hex::decode("d41d8cd98f00b204e9800998ecf8427e")
@@ -169,7 +169,7 @@ async fn test_empty_password() {
 #[tokio::test]
 async fn test_long_password() {
     // Test with a longer password (but still under MAX_MSG_SIZE)
-    let cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
+    let mut cracker = GpuCracker::new().await.expect("Failed to initialize GPU");
 
     let target_password = "this_is_a_much_longer_password_for_testing_purposes_12345";
     let target_hash_str = format!("{:x}", md5::compute(target_password.as_bytes()));

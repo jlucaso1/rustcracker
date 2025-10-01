@@ -116,7 +116,7 @@ fn bench_gpu_throughput(c: &mut Criterion) {
     group.sample_size(10); // Reduce sample size for GPU benchmarks (they're slower)
 
     // Initialize GPU cracker once
-    let cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
+    let mut cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
 
     // Generate a target hash (for "password123")
     let target_password = "password123";
@@ -148,7 +148,7 @@ fn bench_end_to_end_cracking(c: &mut Criterion) {
     let mut group = c.benchmark_group("End-to-End Cracking");
     group.sample_size(10); // GPU benchmarks are slower
 
-    let cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
+    let mut cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
 
     // Scenario 1: Password at the beginning
     let password_start = "target_password_start";
@@ -203,7 +203,7 @@ fn bench_variable_password_lengths(c: &mut Criterion) {
     let mut group = c.benchmark_group("Variable Password Lengths");
     group.sample_size(10);
 
-    let cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
+    let mut cracker = pollster::block_on(GpuCracker::new()).expect("Failed to initialize GPU");
 
     // Test with uniform short passwords
     let short_wordlist: Vec<String> = (0..BATCH_SIZE).map(|i| format!("pwd{i}")).collect();

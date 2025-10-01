@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize GPU cracker
     println!("Initializing GPU...");
-    let cracker = pollster::block_on(GpuCracker::new())?;
+    let mut cracker = pollster::block_on(GpuCracker::new())?;
 
     // Attempt to crack the hash
     println!("Cracking hash {target_hash_str}...");
