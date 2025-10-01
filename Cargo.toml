@@ -1,6 +1,18 @@
 [package]
 name = "rustcracker"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+bytemuck = { version = "1.13", features = ["derive"] }
+hex = "0.4"
+md5 = "0.7" # For testing/verification
+pollster = "0.3"
+wgpu = { version = "0.20", features = ["spirv"] }
+
+[build-dependencies]
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
