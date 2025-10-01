@@ -136,7 +136,7 @@ impl GpuCracker {
     /// Initialize the GPU cracker
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         // Create wgpu instance with Vulkan backend (for AMD GPU support)
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
@@ -148,8 +148,7 @@ impl GpuCracker {
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
-            .await
-            .ok_or("Failed to find suitable GPU adapter")?;
+            .await?;
 
         println!("Using GPU: {}", adapter.get_info().name);
 
@@ -158,18 +157,17 @@ impl GpuCracker {
 
         // Request device and queue with timestamp support if available
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("GPU Device"),
-                    required_features: if supports_timestamps {
-                        wgpu::Features::TIMESTAMP_QUERY
-                    } else {
-                        wgpu::Features::empty()
-                    },
-                    required_limits: wgpu::Limits::default(),
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("GPU Device"),
+                required_features: if supports_timestamps {
+                    wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
                 },
-                None,
-            )
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await?;
 
         // Load the compiled shader
@@ -269,8 +267,9 @@ impl GpuCracker {
             label: Some("MD5 Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
-            entry_point: "md5_crack",
+            entry_point: Some("md5_crack"),
             compilation_options: Default::default(),
+            cache: None,
         });
 
         // Create shared buffers (don't need double-buffering)
@@ -420,7 +419,9 @@ impl GpuCracker {
             sender.send(result).unwrap();
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::Wait)
+            .expect("Failed to poll device");
         receiver.recv().unwrap().unwrap();
 
         let data = buffer_slice.get_mapped_range();
@@ -597,7 +598,9 @@ impl GpuCracker {
             sender.send(result).unwrap();
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::Wait)
+            .expect("Failed to poll device");
         receiver.recv().unwrap().unwrap();
 
         let data = buffer_slice.get_mapped_range();
@@ -745,7 +748,9 @@ impl GpuCracker {
             sender.send(result).unwrap();
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::Wait)
+            .expect("Failed to poll device");
         receiver.recv().unwrap().unwrap();
 
         let data = buffer_slice.get_mapped_range();
@@ -760,7 +765,9 @@ impl GpuCracker {
             sender2.send(result).unwrap();
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::Wait)
+            .expect("Failed to poll device");
         receiver2.recv().unwrap().unwrap();
 
         let timestamp_data = query_slice.get_mapped_range();

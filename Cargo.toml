@@ -6,15 +6,15 @@ edition = "2021"
 [dependencies]
 bytemuck = { version = "1.13", features = ["derive"] }
 hex = "0.4"
-md5 = "0.7" # For testing/verification
-pollster = "0.3"
-wgpu = { version = "0.20", features = ["spirv"] }
+md5 = "0.8" # For testing/verification
+pollster = "0.4"
+wgpu = { version = "26", features = ["spirv"] }
 
 [build-dependencies]
-spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu" }
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu", rev = "29ba02d61e0d3393f747831f79d0db1128bcb88d" }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.7", features = ["html_reports"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 
