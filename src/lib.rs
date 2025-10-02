@@ -5,6 +5,36 @@ use std::borrow::Cow;
 pub const BATCH_SIZE: usize = 65536; // Optimized for GPU utilization (was 4096)
 pub const MAX_MSG_SIZE: usize = 256;
 
+/// Append the MD5 16-word blocks for a message into the provided buffer
+/// Returns the number of 64-byte blocks appended
+fn append_md5_blocks_for(msg: &[u8], out: &mut Vec<u32>) -> u32 {
+    let len = msg.len();
+    let block_bytes = (len + 9).div_ceil(64) * 64;
+    let mut data = Vec::with_capacity(block_bytes);
+    data.extend_from_slice(msg);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    let bit_len = (len as u64) * 8;
+    data.extend_from_slice(&bit_len.to_le_bytes());
+
+    let block_count = data.len() / 64;
+    out.reserve(block_count * 16);
+
+    for chunk in data.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for (i, &byte) in chunk.iter().enumerate() {
+            let wi = i / 4;
+            let bi = i % 4;
+            m[wi] |= (byte as u32) << (bi * 8);
+        }
+        out.extend_from_slice(&m);
+    }
+
+    block_count as u32
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct TargetHash {
@@ -15,8 +45,8 @@ pub struct TargetHash {
 /// Used for double-buffering to overlap CPU and GPU work
 struct BufferSet {
     messages_buffer: wgpu::Buffer,
-    lengths_buffer: wgpu::Buffer,
-    offsets_buffer: wgpu::Buffer,
+    message_count_buffer: wgpu::Buffer,
+    block_offsets_buffer: wgpu::Buffer,
     result_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -27,28 +57,28 @@ impl BufferSet {
         device: &wgpu::Device,
         bind_group_layout: &wgpu::BindGroupLayout,
         target_buffer: &wgpu::Buffer,
-        message_count_buffer: &wgpu::Buffer,
         label: &str,
     ) -> Self {
         // Allocate buffers for this set
-        let max_message_bytes = MAX_MSG_SIZE * BATCH_SIZE;
+        // Each message is now up to 5 blocks (320 bytes) preprocessed
+        let messages_buffer_size = (BATCH_SIZE * 5 * 16 * 4) as u64;
         let messages_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("{label} Messages Buffer")),
-            size: max_message_bytes as u64,
+            size: messages_buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let lengths_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("{label} Lengths Buffer")),
-            size: (BATCH_SIZE * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        let message_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("{label} Message Count Buffer")),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("{label} Offsets Buffer")),
-            size: (BATCH_SIZE * 4) as u64,
+        let block_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("{label} Block Offsets Buffer")),
+            size: ((BATCH_SIZE as u64) + 1) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -80,31 +110,27 @@ impl BufferSet {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: lengths_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: offsets_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
                     resource: target_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: 2,
                     resource: result_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 5,
+                    binding: 3,
                     resource: message_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: block_offsets_buffer.as_entire_binding(),
                 },
             ],
         });
 
         Self {
             messages_buffer,
-            lengths_buffer,
-            offsets_buffer,
+            message_count_buffer,
+            block_offsets_buffer,
             result_buffer,
             staging_buffer,
             bind_group,
@@ -125,11 +151,9 @@ pub struct GpuCracker {
     buffer_set_b: BufferSet,
     // Shared buffers (don't need double-buffering)
     target_buffer: wgpu::Buffer,
-    message_count_buffer: wgpu::Buffer,
     // Pre-allocated CPU buffers to avoid repeated allocations
-    message_data_bytes: Vec<u8>,
-    message_lengths: Vec<u32>,
-    message_offsets: Vec<u32>,
+    batch_blocks: Vec<u32>, // Preprocessed MD5 blocks
+    block_offsets: Vec<u32>,
 }
 
 impl GpuCracker {
@@ -167,10 +191,13 @@ impl GpuCracker {
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
+                experimental_features: Default::default(),
             })
             .await?;
 
         // Load the compiled shader
+        let shader_path = env!("shader.spv");
+        println!("Loading shader from: {shader_path}");
         let shader_bytes = include_bytes!(env!("shader.spv"));
         // Convert to u32 array for SPIR-V
         let mut shader_u32 = Vec::with_capacity(shader_bytes.len() / 4);
@@ -186,7 +213,7 @@ impl GpuCracker {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MD5 Bind Group Layout"),
             entries: &[
-                // Binding 0: Messages buffer (storage)
+                // messages
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -197,7 +224,7 @@ impl GpuCracker {
                     },
                     count: None,
                 },
-                // Binding 1: Message lengths buffer (storage)
+                // target
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -208,31 +235,9 @@ impl GpuCracker {
                     },
                     count: None,
                 },
-                // Binding 2: Message offsets buffer (storage)
+                // result
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Binding 3: Target hash (storage, read-only)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Binding 4: Result buffer (storage, read-write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -241,12 +246,23 @@ impl GpuCracker {
                     },
                     count: None,
                 },
-                // Binding 5: Message count (uniform)
+                // message_count
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // block_offsets
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -280,33 +296,12 @@ impl GpuCracker {
             mapped_at_creation: false,
         });
 
-        let message_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Message Count Buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         // Create two complete buffer sets for double-buffering
-        let buffer_set_a = BufferSet::new(
-            &device,
-            &bind_group_layout,
-            &target_buffer,
-            &message_count_buffer,
-            "Set A",
-        );
-        let buffer_set_b = BufferSet::new(
-            &device,
-            &bind_group_layout,
-            &target_buffer,
-            &message_count_buffer,
-            "Set B",
-        );
+        let buffer_set_a = BufferSet::new(&device, &bind_group_layout, &target_buffer, "Set A");
+        let buffer_set_b = BufferSet::new(&device, &bind_group_layout, &target_buffer, "Set B");
 
         // Pre-allocate CPU-side buffers with capacity for max batch
-        let message_data_bytes = Vec::with_capacity(MAX_MSG_SIZE * BATCH_SIZE);
-        let message_lengths = Vec::with_capacity(BATCH_SIZE);
-        let message_offsets = Vec::with_capacity(BATCH_SIZE);
+        let batch_blocks = Vec::with_capacity(BATCH_SIZE * 5 * 16);
 
         Ok(Self {
             device,
@@ -317,68 +312,65 @@ impl GpuCracker {
             buffer_set_a,
             buffer_set_b,
             target_buffer,
-            message_count_buffer,
-            message_data_bytes,
-            message_lengths,
-            message_offsets,
+            batch_blocks,
+            block_offsets: Vec::with_capacity(BATCH_SIZE + 1),
         })
+    }
+
+    fn build_cpu_buffers(&mut self, messages: &[&str]) {
+        self.batch_blocks.clear();
+        self.block_offsets.clear();
+        self.block_offsets.push(0);
+        self.block_offsets.reserve(messages.len());
+
+        self.batch_blocks.reserve(messages.len() * 5 * 16);
+
+        let mut total_blocks = 0u32;
+        for msg in messages {
+            let blocks_added = append_md5_blocks_for(msg.as_bytes(), &mut self.batch_blocks);
+            total_blocks += blocks_added;
+            self.block_offsets.push(total_blocks);
+        }
+
+        debug_assert_eq!(self.block_offsets.len(), messages.len() + 1);
+    }
+
+    fn upload_batch_to_gpu(
+        &self,
+        buffer_set: &BufferSet,
+        target_hash: &[u8; 16],
+        message_count: usize,
+    ) {
+        if !self.batch_blocks.is_empty() {
+            let messages_bytes = bytemuck::cast_slice(&self.batch_blocks);
+            self.queue
+                .write_buffer(&buffer_set.messages_buffer, 0, messages_bytes);
+        }
+
+        self.queue.write_buffer(&self.target_buffer, 0, target_hash);
+        self.queue
+            .write_buffer(&buffer_set.result_buffer, 0, &(-1i32).to_le_bytes());
+
+        let mut message_count_bytes = [0u8; 16];
+        message_count_bytes[..4].copy_from_slice(&(message_count as u32).to_le_bytes());
+        self.queue
+            .write_buffer(&buffer_set.message_count_buffer, 0, &message_count_bytes);
+
+        self.queue.write_buffer(
+            &buffer_set.block_offsets_buffer,
+            0,
+            bytemuck::cast_slice(&self.block_offsets),
+        );
     }
 
     /// Process a batch of messages and check against target hash
     pub fn process_batch(&mut self, messages: &[&str], target_hash: &[u8; 16]) -> Option<usize> {
-        // Clear and reuse pre-allocated buffers
-        self.message_data_bytes.clear();
-        self.message_lengths.clear();
-        self.message_offsets.clear();
-
-        let mut current_offset = 0u32;
-
-        // Prepare message data
-        for msg in messages {
-            let msg_bytes = msg.as_bytes();
-            self.message_offsets.push(current_offset);
-            self.message_lengths.push(msg_bytes.len() as u32);
-            self.message_data_bytes.extend_from_slice(msg_bytes);
-            current_offset += msg_bytes.len() as u32;
-        }
-
-        // Pad arrays to BATCH_SIZE
-        while self.message_lengths.len() < BATCH_SIZE {
-            self.message_offsets.push(current_offset);
-            self.message_lengths.push(0);
-        }
-
-        // Pack bytes into u32 words (GPU shader expects u32 array)
-        let aligned_size = (self.message_data_bytes.len() + 3) & !3;
-        self.message_data_bytes.resize(aligned_size, 0);
-        let messages_u32: &[u32] = bytemuck::cast_slice(&self.message_data_bytes);
-        let messages_bytes = bytemuck::cast_slice(messages_u32);
+        self.build_cpu_buffers(messages);
 
         // Use buffer_set_a for now (will implement pipelining later)
         let buffer_set = &self.buffer_set_a;
 
-        if !messages_bytes.is_empty() {
-            self.queue
-                .write_buffer(&buffer_set.messages_buffer, 0, messages_bytes);
-        } else {
-            self.queue
-                .write_buffer(&buffer_set.messages_buffer, 0, &[0u8; 4]);
-        }
-
-        let lengths_bytes = bytemuck::cast_slice(&self.message_lengths);
-        let offsets_bytes = bytemuck::cast_slice(&self.message_offsets);
-        self.queue
-            .write_buffer(&buffer_set.lengths_buffer, 0, lengths_bytes);
-        self.queue
-            .write_buffer(&buffer_set.offsets_buffer, 0, offsets_bytes);
-        self.queue.write_buffer(&self.target_buffer, 0, target_hash);
-        self.queue
-            .write_buffer(&buffer_set.result_buffer, 0, &(-1i32).to_le_bytes());
-        self.queue.write_buffer(
-            &self.message_count_buffer,
-            0,
-            &(messages.len() as u32).to_le_bytes(),
-        );
+        self.upload_batch_to_gpu(buffer_set, target_hash, messages.len());
 
         // Create command encoder and dispatch compute shader
         let mut encoder = self
@@ -420,7 +412,7 @@ impl GpuCracker {
         });
 
         self.device
-            .poll(wgpu::PollType::Wait)
+            .poll(wgpu::PollType::wait_indefinitely())
             .expect("Failed to poll device");
         receiver.recv().unwrap().unwrap();
 
@@ -474,6 +466,18 @@ impl GpuCracker {
         None
     }
 
+    /// Prepare batch data on CPU (no GPU submission)
+    fn prepare_batch(&mut self, use_set_b: bool, messages: &[&str], target_hash: &[u8; 16]) {
+        self.build_cpu_buffers(messages);
+
+        let buffer_set = if use_set_b {
+            &self.buffer_set_b
+        } else {
+            &self.buffer_set_a
+        };
+        self.upload_batch_to_gpu(buffer_set, target_hash, messages.len());
+    }
+
     /// Prepare batch data on CPU and submit to GPU (combined)
     fn prepare_and_submit_batch(
         &mut self,
@@ -483,66 +487,6 @@ impl GpuCracker {
     ) {
         self.prepare_batch(use_set_b, messages, target_hash);
         self.submit_batch(use_set_b, messages.len());
-    }
-
-    /// Prepare batch data on CPU (no GPU submission)
-    fn prepare_batch(&mut self, use_set_b: bool, messages: &[&str], target_hash: &[u8; 16]) {
-        let buffer_set = if use_set_b {
-            &self.buffer_set_b
-        } else {
-            &self.buffer_set_a
-        };
-        // Clear and reuse pre-allocated buffers
-        self.message_data_bytes.clear();
-        self.message_lengths.clear();
-        self.message_offsets.clear();
-
-        let mut current_offset = 0u32;
-
-        // Prepare message data
-        for msg in messages {
-            let msg_bytes = msg.as_bytes();
-            self.message_offsets.push(current_offset);
-            self.message_lengths.push(msg_bytes.len() as u32);
-            self.message_data_bytes.extend_from_slice(msg_bytes);
-            current_offset += msg_bytes.len() as u32;
-        }
-
-        // Pad arrays to BATCH_SIZE
-        while self.message_lengths.len() < BATCH_SIZE {
-            self.message_offsets.push(current_offset);
-            self.message_lengths.push(0);
-        }
-
-        // Pack bytes into u32 words
-        let aligned_size = (self.message_data_bytes.len() + 3) & !3;
-        self.message_data_bytes.resize(aligned_size, 0);
-        let messages_u32: &[u32] = bytemuck::cast_slice(&self.message_data_bytes);
-        let messages_bytes = bytemuck::cast_slice(messages_u32);
-
-        // Write data to GPU buffers
-        if !messages_bytes.is_empty() {
-            self.queue
-                .write_buffer(&buffer_set.messages_buffer, 0, messages_bytes);
-        } else {
-            self.queue
-                .write_buffer(&buffer_set.messages_buffer, 0, &[0u8; 4]);
-        }
-
-        let lengths_bytes = bytemuck::cast_slice(&self.message_lengths);
-        let offsets_bytes = bytemuck::cast_slice(&self.message_offsets);
-        self.queue
-            .write_buffer(&buffer_set.lengths_buffer, 0, lengths_bytes);
-        self.queue
-            .write_buffer(&buffer_set.offsets_buffer, 0, offsets_bytes);
-        self.queue.write_buffer(&self.target_buffer, 0, target_hash);
-        self.queue
-            .write_buffer(&buffer_set.result_buffer, 0, &(-1i32).to_le_bytes());
-        self.queue.write_buffer(
-            &self.message_count_buffer,
-            0,
-            &(messages.len() as u32).to_le_bytes(),
-        );
     }
 
     /// Submit batch to GPU (non-blocking)
@@ -599,7 +543,7 @@ impl GpuCracker {
         });
 
         self.device
-            .poll(wgpu::PollType::Wait)
+            .poll(wgpu::PollType::wait_indefinitely())
             .expect("Failed to poll device");
         receiver.recv().unwrap().unwrap();
 
@@ -627,59 +571,13 @@ impl GpuCracker {
             return (self.process_batch(messages, target_hash), None);
         }
 
-        // Reuse pre-allocated buffers
-        self.message_data_bytes.clear();
-        self.message_lengths.clear();
-        self.message_offsets.clear();
-
-        let mut current_offset = 0u32;
-
-        // Prepare message data
-        for msg in messages {
-            let msg_bytes = msg.as_bytes();
-            self.message_offsets.push(current_offset);
-            self.message_lengths.push(msg_bytes.len() as u32);
-            self.message_data_bytes.extend_from_slice(msg_bytes);
-            current_offset += msg_bytes.len() as u32;
-        }
-
-        // Pad arrays to BATCH_SIZE
-        while self.message_lengths.len() < BATCH_SIZE {
-            self.message_offsets.push(current_offset);
-            self.message_lengths.push(0);
-        }
-
-        // Pack bytes into u32 words with bytemuck (zero-copy)
-        let aligned_size = (self.message_data_bytes.len() + 3) & !3;
-        self.message_data_bytes.resize(aligned_size, 0);
-        let messages_u32: &[u32] = bytemuck::cast_slice(&self.message_data_bytes);
-        let messages_bytes = bytemuck::cast_slice(messages_u32);
+        self.build_cpu_buffers(messages);
 
         // Use buffer_set_a for timing measurements
         let buffer_set = &self.buffer_set_a;
 
-        if !messages_bytes.is_empty() {
-            self.queue
-                .write_buffer(&buffer_set.messages_buffer, 0, messages_bytes);
-        } else {
-            self.queue
-                .write_buffer(&buffer_set.messages_buffer, 0, &[0u8; 4]);
-        }
-
-        let lengths_bytes = bytemuck::cast_slice(&self.message_lengths);
-        let offsets_bytes = bytemuck::cast_slice(&self.message_offsets);
-        self.queue
-            .write_buffer(&buffer_set.lengths_buffer, 0, lengths_bytes);
-        self.queue
-            .write_buffer(&buffer_set.offsets_buffer, 0, offsets_bytes);
-        self.queue.write_buffer(&self.target_buffer, 0, target_hash);
-        self.queue
-            .write_buffer(&buffer_set.result_buffer, 0, &(-1i32).to_le_bytes());
-        self.queue.write_buffer(
-            &self.message_count_buffer,
-            0,
-            &(messages.len() as u32).to_le_bytes(),
-        );
+        // Write preprocessed data directly to GPU buffers
+        self.upload_batch_to_gpu(buffer_set, target_hash, messages.len());
 
         // Create timestamp query set
         let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -749,7 +647,7 @@ impl GpuCracker {
         });
 
         self.device
-            .poll(wgpu::PollType::Wait)
+            .poll(wgpu::PollType::wait_indefinitely())
             .expect("Failed to poll device");
         receiver.recv().unwrap().unwrap();
 
@@ -766,7 +664,7 @@ impl GpuCracker {
         });
 
         self.device
-            .poll(wgpu::PollType::Wait)
+            .poll(wgpu::PollType::wait_indefinitely())
             .expect("Failed to poll device");
         receiver2.recv().unwrap().unwrap();
 

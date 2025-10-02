@@ -5,10 +5,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .print_metadata(MetadataPrintout::Full)
         .build()?;
 
-    println!(
-        "cargo:warning=Shader compiled to: {:?}",
-        result.module.unwrap_single()
-    );
+    let path = result.module.unwrap_single();
+    println!("cargo:rustc-env=shader.spv={}", path.display());
+    println!("cargo:warning=Shader compiled to: {path:?}");
 
     Ok(())
 }

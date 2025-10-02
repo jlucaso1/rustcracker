@@ -39,11 +39,10 @@ fn leftrotate(x: u32, amt: u32) -> u32 {
 pub fn md5_crack(
     #[spirv(global_invocation_id)] global_id: UVec3,
     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] messages: &[u32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] message_lengths: &[u32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] message_offsets: &[u32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] target_hash: &[u32; 4],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] result_buffer: &mut [i32],
-    #[spirv(uniform, descriptor_set = 0, binding = 5)] message_count: &u32,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] target_hash: &[u32; 4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] result_buffer: &mut [i32],
+    #[spirv(uniform, descriptor_set = 0, binding = 3)] message_count: &u32,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] block_offsets: &[u32],
 ) {
     let idx = global_id.x as usize;
 
@@ -52,60 +51,31 @@ pub fn md5_crack(
         return;
     }
 
-    let msg_len = message_lengths[idx];
-    let msg_offset_bytes = message_offsets[idx] as usize;
+    let block_start = block_offsets[idx] as usize;
+    let block_end = block_offsets[idx + 1] as usize;
+    let num_blocks = block_end - block_start;
 
-    // Preprocess message inline - use u32 array to avoid Int8 capability
-    let mut preprocessed: [u32; 128] = [0; 128];
-
-    // Copy message (extract bytes from u32 words and pack into new u32s)
-    let mut i = 0u32;
-    while i < msg_len {
-        let src_word_idx = (msg_offset_bytes + i as usize) / 4;
-        let src_byte_in_word = (msg_offset_bytes + i as usize) % 4;
-        let byte_val = (messages[src_word_idx] >> (src_byte_in_word * 8)) & 0xFF;
-
-        let dst_word_idx = (i as usize) / 4;
-        let dst_byte_in_word = (i as usize) % 4;
-        preprocessed[dst_word_idx] |= byte_val << (dst_byte_in_word * 8);
-        i += 1;
+    if num_blocks == 0 {
+        return;
     }
 
-    // Add padding byte (0x80)
-    let pad_byte_idx = msg_len as usize;
-    let pad_word_idx = pad_byte_idx / 4;
-    let pad_byte_in_word = pad_byte_idx % 4;
-    preprocessed[pad_word_idx] |= 0x80u32 << (pad_byte_in_word * 8);
+    let mut h = [A0, B0, C0, D0];
 
-    // Calculate size in bits (use two u32s to represent 64-bit value)
-    let size_in_bits_low = msg_len * 8;
-    let size_in_bits_high = 0u32; // For messages < 512MB
-    let preprocessed_size_words = (msg_len + 8 + 1).div_ceil(64) * 16; // In words, not bytes
-
-    // Add length at the end (64-bit little-endian, split into two u32s)
-    preprocessed[(preprocessed_size_words - 2) as usize] = size_in_bits_low;
-    preprocessed[(preprocessed_size_words - 1) as usize] = size_in_bits_high;
-
-    // Compute MD5 inline
-    let mut a = A0;
-    let mut b = B0;
-    let mut c = C0;
-    let mut d = D0;
-
-    // Process each 64-byte chunk (16 words)
-    let num_chunks = preprocessed_size_words / 16;
-    let mut chunk_idx = 0u32;
-
-    while chunk_idx < num_chunks {
-        let offset = (chunk_idx * 16) as usize;
-
-        // Get 16 32-bit words (already in correct format)
+    for block_idx in 0..num_blocks {
+        // Load preprocessed MD5 block (16 u32 words)
+        let base = (block_start + block_idx) * 16;
         let mut m = [0u32; 16];
         let mut i = 0;
         while i < 16 {
-            m[i] = preprocessed[offset + i];
+            m[i] = messages[base + i];
             i += 1;
         }
+
+        // Compute MD5 round
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
 
         let aa = a;
         let bb = b;
@@ -149,11 +119,11 @@ pub fn md5_crack(
         c = c.wrapping_add(cc);
         d = d.wrapping_add(dd);
 
-        chunk_idx += 1;
+        h = [a, b, c, d];
     }
 
     // Compare with target
-    if a == target_hash[0] && b == target_hash[1] && c == target_hash[2] && d == target_hash[3] {
+    if h[0] == target_hash[0] && h[1] == target_hash[1] && h[2] == target_hash[2] && h[3] == target_hash[3] {
         result_buffer[0] = idx as i32;
     }
 }
